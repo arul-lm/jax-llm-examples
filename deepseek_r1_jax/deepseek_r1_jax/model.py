@@ -1278,6 +1278,52 @@ def load_pytree(path, sharding=None):
         )
 
 
+def count_params(weights: Weights, include_bytes: bool = False):
+    """Total number of parameters (and optionally memory in bytes) in a loaded Weights pytree.
+
+    Works for both loaded weights (jax.Arrays) and abstract weights (ArrayInfo from
+    Weights.abstract(cfg)), e.g. after config is loaded and tensors are prepared or only from config.
+
+    Args:
+        weights: Weights pytree (loaded or abstract).
+        include_bytes: If True, return (num_params, num_bytes).
+
+    Returns:
+        Total parameter count (int), or (num_params, num_bytes) if include_bytes.
+    """
+    def _size_and_bytes(x):
+        if hasattr(x, "size") and hasattr(x, "dtype"):
+            n = int(x.size)
+            return n, n * jnp.dtype(x.dtype).itemsize
+        if hasattr(x, "shape") and hasattr(x, "dtype"):
+            n = math.prod(x.shape)
+            return n, n * jnp.dtype(x.dtype).itemsize
+        return 0, 0
+
+    # ArrayInfo has only meta_fields (no data_fields), so tree.leaves() would see 0 leaves.
+    # Treat ArrayInfo and jax.Array as leaves so we collect them and count.
+    is_weight_leaf = lambda x: is_param(x) or isinstance(x, jax.Array)
+    leaves = jax.tree.leaves(weights, is_leaf=is_weight_leaf)
+    total_params = 0
+    total_bytes = 0
+    for x in leaves:
+        n, b = _size_and_bytes(x)
+        total_params += n
+        total_bytes += b
+    if include_bytes:
+        return total_params, total_bytes
+    return total_params
+
+
+def count_params_from_config(cfg: Config, include_bytes: bool = False):
+    """Total parameters (and optionally memory in bytes) implied by config, without loading tensors.
+
+    Uses Weights.abstract(cfg); no checkpoint or mesh is required.
+    """
+    weights_abst = Weights.abstract(cfg)
+    return count_params(weights_abst, include_bytes=include_bytes)
+
+
 # Inference.
 @partial(jax.jit, static_argnums=(1, 2))
 def prepare_chunk(chunk, pad_to: int, pad_id: int):

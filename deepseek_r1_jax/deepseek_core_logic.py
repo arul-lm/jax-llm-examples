@@ -328,8 +328,6 @@ def generate_mlir(config: Dict) -> str:
             jax.config.update("jax_enable_x64", False)  # Disable x64 for better FP8 compatibility
         # REsponsible for adding source line number
         #jax.config.update("jax_cache_compilation_metadata", True)
-        # Load tokenizer
-        tokenizer = dsjax.load_tokenizer()
 
         # Create mesh
         mesh = jax.make_mesh(
@@ -363,6 +361,15 @@ def generate_mlir(config: Dict) -> str:
         wts_shd = dsjax.Weights.shardings(cfg)
         kv_shrd = dsjax.KVCache.shardings(cfg, batch_size, cfg.max_seq_len)
         kv_abst = dsjax.KVCache.abstract(cfg, batch_size, cfg.max_seq_len)
+
+        num_params, num_bytes = dsjax.count_params(wts_abs, include_bytes=True)
+        print(f"# Total parameters: {num_params}  ({num_bytes} bytes)")
+
+        if config.get("count_params_only"):
+            return f"# Count-params-only mode.\n# Total parameters: {num_params}  (num_bytes: {num_bytes} bytes)"
+
+        # Load tokenizer (after early-exit so count_params_only skips it)
+        tokenizer = dsjax.load_tokenizer()
 
         # Simplified conversion using JAX tree utilities
         # Since ArrayInfo is registered as a pytree, we can use jax.tree.map to automatically traverse
@@ -530,18 +537,22 @@ def generate_mlir(config: Dict) -> str:
 
 # Example usage when run directly
 if __name__ == "__main__":
-    # Check if config file is provided as command line argument
-    if len(sys.argv) != 2:
-        print("Usage: python deepseek_core_logic.py <config_file>")
+    argv = sys.argv[1:]
+    count_params_only = False
+    if argv and argv[0] == "--count-params-only":
+        count_params_only = True
+        argv = argv[1:]
+    if len(argv) != 1:
+        print("Usage: python deepseek_core_logic.py [--count-params-only] <config_file>")
         print("Example: python deepseek_core_logic.py deepseek_config.yaml")
+        print("         python deepseek_core_logic.py --count-params-only deepseek_config.yaml  # exit after printing param count")
         sys.exit(1)
 
-    config_file = sys.argv[1]
-
-    # Load configuration from YAML file
+    config_file = argv[0]
     config = load_config(config_file)
+    if count_params_only:
+        config = dict(config, count_params_only=True)
 
-    # Generate MLIR content
     result = generate_mlir(config)
     #print("Generated MLIR content in otter:", len(result))
     #print(result)
