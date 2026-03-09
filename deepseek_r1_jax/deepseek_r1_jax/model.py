@@ -37,6 +37,10 @@ from .decode_ragged_dot import decode_ragged_dot
 
 PAD_ID = 1
 
+# Supported inference dtypes: exactly one of BF16, FP8, or FP4.
+ALLOWED_DTYPES = (jnp.bfloat16, jnp.float8_e4m3fn, jnp.float4_e2m1fn)
+ALLOWED_DTYPE_NAMES = ("bf16", "fp8", "fp4")
+
 AxisName = str | tuple[str, ...] | None
 Axes = tuple[AxisName, ...]
 
@@ -176,6 +180,13 @@ class Config:
     n_shared_experts: int = 1
     psum_before_expert_reduce: bool = False
     strategy: str = "decode"
+
+    def __post_init__(self):
+        if self.dtype not in ALLOWED_DTYPES:
+            raise ValueError(
+                f"dtype must be exactly one of {ALLOWED_DTYPE_NAMES}, got {self.dtype}. "
+                "Use jnp.bfloat16, jnp.float8_e4m3fn, or jnp.float4_e2m1fn."
+            )
 
 
 def load_tokenizer(
@@ -1322,6 +1333,36 @@ def count_params_from_config(cfg: Config, include_bytes: bool = False):
     """
     weights_abst = Weights.abstract(cfg)
     return count_params(weights_abst, include_bytes=include_bytes)
+
+
+def kv_cache_bytes_per_token(cfg: Config) -> int:
+    """KV cache memory in bytes per single token (one position), for the given config.
+
+    Assumes optimized MLA: store latent (kv_compressed) and k_pe (RoPE) per layer; k_nope and v
+    are recovered at attention time via latent @ k_b and latent @ v_b.
+    Does not include metadata (iter, starts); only the latent and k_pe buffers across all layers.
+
+    Unquantized: num_layers * (kv_lora_rank + qk_rope_head_dim) * dtype.itemsize.
+    Quantized (axis=-1 on each buffer): per layer, (kv_lora_rank int8 + 1 scale) + (qk_rope_head_dim int8 + 1 scale).
+    """
+    L = cfg.num_layers
+    r = cfg.kv_lora_rank
+    d_pe = cfg.qk_rope_head_dim
+    if not cfg.quantize_cache:
+        return kv_cache_elements_per_token(cfg) * jnp.dtype(cfg.dtype).itemsize
+    scale_el = jnp.dtype(cfg.quant_scale_dtype).itemsize
+    bytes_per_layer = (r * 1 + 1 * scale_el) + (d_pe * 1 + 1 * scale_el)
+    return L * bytes_per_layer
+
+
+def kv_cache_elements_per_token(cfg: Config) -> int:
+    """Number of scalar elements in the KV cache per single token (unquantized view).
+
+    Assumes optimized MLA: store latent (kv_compressed, kv_lora_rank) and k_pe (qk_rope_head_dim)
+    per layer; k_nope and v are expanded at attention time from the latent.
+    Equal to num_layers * (kv_lora_rank + qk_rope_head_dim).
+    """
+    return cfg.num_layers * (cfg.kv_lora_rank + cfg.qk_rope_head_dim)
 
 
 # Inference.

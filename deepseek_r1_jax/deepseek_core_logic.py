@@ -133,33 +133,20 @@ def find_xla_dump_file(hlo_dir_path: str) -> str:
 
 def validate_dtype_for_inference(dtype_str: str) -> tuple[bool, str]:
     """
-    Validate if a dtype is suitable for inference and provide warnings.
-
-    Args:
-        dtype_str: The dtype string to validate
-
-    Returns:
-        Tuple of (is_valid, warning_message)
+    Validate that dtype is exactly one of: bf16, fp8, fp4.
+    Returns (is_valid, warning_message).
     """
+    allowed = {"bf16", "fp8", "fp4"}
+    if dtype_str not in allowed:
+        return False, f"dtype must be exactly one of {sorted(allowed)}, got '{dtype_str}'"
+
     warnings = []
+    if dtype_str == "fp4":
+        warnings.append("FP4 is experimental and may have limited hardware/op support")
+    if dtype_str == "fp8":
+        warnings.append("FP8 may require specific hardware (e.g. NVIDIA/TPU) for best support")
 
-    # FP4 warnings
-    if dtype_str in ["fp4", "f4e2m1", "f4e2m1fn"]:
-        warnings.append("FP4 is experimental and may cause numerical instability")
-        warnings.append("Consider using FP8 (f8e4m3fn) for production inference")
-
-    # FP8 warnings
-    if dtype_str in ["f8e4m3fnuz", "f8e5m2fnuz", "f8e4m3b11fnuz"]:
-        warnings.append("NVIDIA-specific FP8 formats may not be supported on all hardware")
-
-    # Very low precision warnings
-    if dtype_str in ["fp4", "f4e2m1", "f4e2m1fn"]:
-        warnings.append("Very low precision may require careful model tuning")
-
-    is_valid = True
-    warning_msg = "; ".join(warnings) if warnings else ""
-
-    return is_valid, warning_msg
+    return True, "; ".join(warnings) if warnings else ""
 
 def save_mlir(config: Dict, hlo_dir_path: str):
     print("Running save mlir step...")
@@ -180,7 +167,7 @@ def generate_mlir(config: Dict) -> str:
     Args:
         config: Dictionary containing configuration parameters for MLIR generation.
                Must include the following fields:
-               - dtype: Data type (e.g., "f32", "f16", "bf16", "fp8", "f8e4m3fn", "f8e5m2", etc.)
+               - dtype: Data type — exactly one of "bf16", "fp8", or "fp4"
                - seq_len: Sequence length
                - num_devices: Number of devices for distributed execution
                - batch_size: Batch size
@@ -198,26 +185,28 @@ def generate_mlir(config: Dict) -> str:
         String containing the generated MLIR content in SDY dialect
 
     Note:
-        FP8 Data Type Recommendations for Inference:
-        - "fp8" or "f8e4m3fn": Recommended for general inference (IEEE 754-2008 E4M3)
-          - Good balance between precision and range
-          - Widely supported on modern hardware
-          - Suitable for most transformer operations
-
-        - "f8e5m2": Use when you need larger dynamic range
-          - Better for operations with wide value ranges
-          - May have slightly lower precision than E4M3
-
-        - "f8e4m3fnuz": NVIDIA format with no underflow
-          - Optimized for NVIDIA hardware
-          - Good for gradient computations
-
-        - "fp4" or "f4e2m1fn": Experimental, use with caution
-          - Maximum compression but limited precision
-          - May require careful tuning for stability
+        Supported dtypes (exactly one): bf16, fp8, fp4.
+        - bf16: Default; best compatibility.
+        - fp8: E4M3; may require specific hardware.
+        - fp4: Experimental; limited op/hardware support.
     """
     # Extract configuration parameters
     dtype_str = config.get("dtype", "bf16")
+    # Normalize to canonical: exactly one of bf16, fp8, fp4
+    dtype_aliases = {
+        "bf16": "bf16",
+        "bfloat16": "bf16",
+        "fp8": "fp8",
+        "f8e4m3fn": "fp8",
+        "f8e5m2": "fp8",
+        "fp4": "fp4",
+        "f4e2m1": "fp4",
+        "f4e2m1fn": "fp4",
+    }
+    dtype_str = dtype_aliases.get(
+        dtype_str.lower() if isinstance(dtype_str, str) else str(dtype_str).lower(),
+        dtype_str,
+    )
     seq_len = config.get("seq_len", 8192)
     num_devices = config.get("num_devices", None)
     batch_size = config.get("batch_size", 16)
@@ -267,38 +256,23 @@ def generate_mlir(config: Dict) -> str:
     if dsjax is None:
         return f"# Error: deepseek_r1_jax module not available\n# Config: dtype={dtype_str}, seq_len={seq_len}, num_devices={num_devices}, batch_size={batch_size}, num_layers={num_layers}, num_experts={num_experts}"
     try:
-        # Convert dtype string to JAX dtype
+        # Convert dtype string to JAX dtype (exactly one of FP4, FP8, BF16)
         dtype_map = {
-            # Standard precision formats
-            "f32": jnp.float32,
-            "f16": jnp.float16,
             "bf16": jnp.bfloat16,
-
-            # FP8 variants (IEEE 754-2008 and NVIDIA formats)
-            "fp8": jnp.float8_e4m3fn,  # Default FP8 for inference
-            "f8e4m3fn": jnp.float8_e4m3fn,  # IEEE 754-2008 FP8 E4M3
-            "f8e5m2": jnp.float8_e5m2,      # IEEE 754-2008 FP8 E5M2
-            "f8e4m3b11fnuz": jnp.float8_e4m3b11fnuz,  # NVIDIA FP8 E4M3 with bias 11
-            "f8e5m2fnuz": jnp.float8_e5m2fnuz,        # NVIDIA FP8 E5M2 with no underflow
-            "f8e4m3fnuz": jnp.float8_e4m3fnuz,        # NVIDIA FP8 E4M3 with no underflow
-
-            # FP4 variants (experimental)
-            "fp4": jnp.float4_e2m1fn,  # Default FP4 for inference
-            "f4e2m1": jnp.float4_e2m1fn,  # FP4 E2M1 format
-            "f4e2m1fn": jnp.float4_e2m1fn,  # FP4 E2M1 format (explicit)
+            "fp8": jnp.float8_e4m3fn,
+            "fp4": jnp.float4_e2m1fn,
         }
-        
-        # Validate dtype
+        # Validate dtype is one of the three allowed
         if dtype_str not in dtype_map:
-            error_msg = f"# Error: Unsupported dtype '{dtype_str}'. Supported dtypes: {list(dtype_map.keys())}"
+            error_msg = f"# Error: Unsupported dtype '{dtype_str}'. Use exactly one of: bf16, fp8, fp4"
             print(error_msg)
             return error_msg
-        print(f"# Debug: dtype_map: {dtype_str}")
-        # Validate dtype for inference and provide warnings
+        print(f"# Debug: dtype: {dtype_str}")
+        # Validate dtype for inference and show warnings
         is_valid, warning_msg = validate_dtype_for_inference(dtype_str)
 
         if not is_valid:
-            error_msg = f"# Error: Invalid dtype '{dtype_str}' for inference: {warning_msg}"
+            error_msg = f"# Error: Invalid dtype '{dtype_str}': {warning_msg}"
             print(error_msg)
             return error_msg
         if warning_msg:
@@ -321,11 +295,16 @@ def generate_mlir(config: Dict) -> str:
         os.environ['XLA_FLAGS'] = f'--xla_force_host_platform_device_count={num_devices} --xla_dump_hlo_pass_re=spmd* --xla_dump_hlo_as_text --xla_dump_to={hlo_dir_path}'
         jax.config.update("jax_use_shardy_partitioner", True)
 
-        # Set JAX configuration to handle FP8 more gracefully
-        if dtype_str in ["fp8", "f8e4m3fn", "f8e5m2", "f8e4m3fnuz", "f8e5m2fnuz", "f8e4m3b11fnuz"]:
-            print(f"# Debug: Configuring JAX for FP8 operations with {dtype_str}")
-            # Enable FP8 support in JAX
-            jax.config.update("jax_enable_x64", False)  # Disable x64 for better FP8 compatibility
+        # Set JAX configuration for low-precision dtypes
+        if dtype_str == "fp8":
+            print(f"# Debug: Configuring JAX for FP8 with {dtype_str}")
+            jax.config.update("jax_enable_x64", False)
+        if dtype_str == "fp4":
+            print(f"# Debug: Configuring JAX for FP4 (experimental) with {dtype_str}")
+            jax.config.update("jax_enable_x64", False)
+            # FP4 on CPU/GPU: XLA can assign 4-bit layout E(4) globally; top_k decomposer's
+            # iota(s32) then gets E(4) and CPU/GPU error with \"custom element sizes on
+            # non-sub-byte types\". We set moe_gate_dtype=float32 for fp4/fp8 below to mitigate.
         # REsponsible for adding source line number
         #jax.config.update("jax_cache_compilation_metadata", True)
 
@@ -352,7 +331,11 @@ def generate_mlir(config: Dict) -> str:
         cfg = dataclasses.replace(cfg, max_seq_len=seq_len)
         # Setting the below flag to True triggers error:interpret mode is only supported on CPU backend.
         cfg = dataclasses.replace(cfg, use_decode_ragged_dot_kernel=False)
-        cfg = dataclasses.replace(cfg, moe_gate_dtype=dtype)
+        # Use float32 for MoE routing when dtype is FP4 (and FP8) so that top_k's internal iota
+        # does not get a sub-byte layout (E(4)); XLA CPU/GPU rejects "custom element sizes on
+        # non-sub-byte types" when iota (s32) is given a 4-bit layout.
+        moe_gate_dtype = jnp.float32 if dtype_str in ("fp4", "fp8") else dtype
+        cfg = dataclasses.replace(cfg, moe_gate_dtype=moe_gate_dtype)
 
         # Set dtype in config (Config class has dtype field, but not compute_dtype or param_dtype)
         cfg = dataclasses.replace(cfg, dtype=dtype)
@@ -363,12 +346,13 @@ def generate_mlir(config: Dict) -> str:
         kv_abst = dsjax.KVCache.abstract(cfg, batch_size, cfg.max_seq_len)
 
         num_params, num_bytes = dsjax.count_params(wts_abs, include_bytes=True)
+        kv_cache_bytes_per_tok = dsjax.kv_cache_bytes_per_token(cfg)
         print(f"# Total parameters: {num_params}  ({num_bytes} bytes)")
+        print(f"# KV cache bytes per token: {kv_cache_bytes_per_tok} bytes")
+        if config.get("static_stats"):
+            return f"# Static stats mode.\n# Total parameters: {num_params}  ({num_bytes} bytes)\n# KV cache bytes per token: {kv_cache_bytes_per_tok} bytes"
 
-        if config.get("count_params_only"):
-            return f"# Count-params-only mode.\n# Total parameters: {num_params}  (num_bytes: {num_bytes} bytes)"
-
-        # Load tokenizer (after early-exit so count_params_only skips it)
+        # Load tokenizer (after early-exit so static_stats skips it)
         tokenizer = dsjax.load_tokenizer()
 
         # Simplified conversion using JAX tree utilities
@@ -538,20 +522,20 @@ def generate_mlir(config: Dict) -> str:
 # Example usage when run directly
 if __name__ == "__main__":
     argv = sys.argv[1:]
-    count_params_only = False
-    if argv and argv[0] == "--count-params-only":
-        count_params_only = True
+    static_stats = False
+    if argv and argv[0] == "--static-stats":
+        static_stats = True
         argv = argv[1:]
     if len(argv) != 1:
-        print("Usage: python deepseek_core_logic.py [--count-params-only] <config_file>")
+        print("Usage: python deepseek_core_logic.py [--static-stats] <config_file>")
         print("Example: python deepseek_core_logic.py deepseek_config.yaml")
-        print("         python deepseek_core_logic.py --count-params-only deepseek_config.yaml  # exit after printing param count")
+        print("         python deepseek_core_logic.py --static-stats deepseek_config.yaml  # exit after printing params and KV cache stats")
         sys.exit(1)
 
     config_file = argv[0]
     config = load_config(config_file)
-    if count_params_only:
-        config = dict(config, count_params_only=True)
+    if static_stats:
+        config = dict(config, static_stats=True)
 
     result = generate_mlir(config)
     #print("Generated MLIR content in otter:", len(result))
