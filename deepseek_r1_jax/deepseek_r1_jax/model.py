@@ -1335,6 +1335,87 @@ def count_params_from_config(cfg: Config, include_bytes: bool = False):
     return count_params(weights_abst, include_bytes=include_bytes)
 
 
+def active_params_per_token_from_config(cfg: Config, include_bytes: bool = False):
+    """Active (used) parameters per token implied by config.
+
+    For each token in the forward pass we use:
+    - Embedding: one row (embed params).
+    - Every layer: full attention + layer norms.
+    - Dense layers (first_k_dense): full MLP.
+    - MoE layers: router + shared expert + num_experts_per_tok routed experts (not all
+      n_routed_experts).
+    - Final: gamma_final + lm_head.
+
+    So active per token < total params when the model has MoE (only a subset of experts
+    are used per token).
+
+    Args:
+        cfg: Config (no mesh or weights required).
+        include_bytes: If True, return (num_active_params, num_bytes) using cfg.dtype
+            for weight bytes.
+
+    Returns:
+        Active parameter count (int), or (num_active_params, num_bytes) if include_bytes.
+    """
+    e = cfg.embed
+    qr = cfg.q_lora_rank
+    vr = cfg.kv_lora_rank
+    h = cfg.num_heads
+    q_nope = cfg.qk_nope_head_dim
+    q_rope = cfg.qk_rope_head_dim
+    q_head = q_nope + q_rope
+    v_head = cfg.v_head_dim
+    ffw = cfg.ffw_size
+    n_routed = cfg.n_routed_experts
+    n_shared = cfg.n_shared_experts
+    moe_ffw = cfg.moe_ffw_size
+    k_active = cfg.num_experts_per_tok
+    L = cfg.num_layers
+    first_dense = cfg.first_k_dense
+    V = cfg.vocab_size
+
+    # Attention (one layer): all params used every token
+    attn_per_layer = (
+        e * qr + qr
+        + qr * h * q_head
+        + e * vr + e * q_rope + vr
+        + vr * h * q_nope
+        + vr * h * v_head
+        + h * v_head * e
+    )
+    # Layer norms per layer (gamma_pre_attn, gamma_post_attn)
+    layer_norms_per_layer = 2 * e
+    # Dense MLP (one layer)
+    mlp_dense_per_layer = e * ffw + e * ffw + ffw * e
+    # MoE: router + shared expert + (k_active experts' gate/up/down)
+    moe_router = e * n_routed + n_routed
+    moe_shared = (
+        e * (n_shared * moe_ffw) * 2
+        + moe_ffw * (n_shared * e)
+    )
+    moe_routed_per_expert = e * moe_ffw + e * moe_ffw + moe_ffw * e
+    moe_routed_active_per_layer = k_active * moe_routed_per_expert
+
+    active = 0
+    # Embedding: one row per token
+    active += e
+    # Layers
+    for i in range(L):
+        active += attn_per_layer + layer_norms_per_layer
+        if i < first_dense:
+            active += mlp_dense_per_layer
+        else:
+            active += moe_router + moe_shared + moe_routed_active_per_layer
+    # Final norm + lm_head
+    active += e + e * V
+
+    if include_bytes:
+        # Use config dtype for weight bytes (approximate; quantized weights would differ)
+        itemsize = jnp.dtype(cfg.dtype).itemsize
+        return active, active * itemsize
+    return active
+
+
 def kv_cache_bytes_per_token(cfg: Config) -> int:
     """KV cache memory in bytes per single token (one position), for the given config.
 

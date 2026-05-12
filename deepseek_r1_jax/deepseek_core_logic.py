@@ -347,8 +347,10 @@ def generate_mlir(config: Dict) -> str:
 
         num_params, num_bytes = dsjax.count_params(wts_abs, include_bytes=True)
         kv_cache_bytes_per_tok = dsjax.kv_cache_bytes_per_token(cfg)
+        active_params, active_bytes = dsjax.active_params_per_token_from_config(cfg, include_bytes=True)
         print(f"# Total parameters: {num_params}  ({num_bytes} bytes)")
         print(f"# KV cache bytes per token: {kv_cache_bytes_per_tok} bytes")
+        print(f"# Active parameters: {active_params}  ({active_bytes} bytes)")
         if config.get("static_stats"):
             return f"# Static stats mode.\n# Total parameters: {num_params}  ({num_bytes} bytes)\n# KV cache bytes per token: {kv_cache_bytes_per_tok} bytes"
 
