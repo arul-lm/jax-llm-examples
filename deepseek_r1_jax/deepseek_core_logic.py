@@ -180,6 +180,8 @@ def generate_mlir(config: Dict) -> str:
                - mesh_axes: Tuple for mesh axes
                - input_text: Text input for the model
                - remote_mlir_output_path: Path where to save the MLIR content (optional)
+               - vocab_size: Optional LM head / embedding vocab size (defaults from dsjax.Config)
+               - ffw_size: Optional dense MLP intermediate width (defaults from dsjax.Config)
 
     Returns:
         String containing the generated MLIR content in SDY dialect
@@ -323,6 +325,12 @@ def generate_mlir(config: Dict) -> str:
         cfg = dataclasses.replace(cfg, num_heads=num_heads)
         embed = per_head_dim * num_heads
         cfg = dataclasses.replace(cfg, embed=embed)
+        if config.get("vocab_size") is not None:
+            cfg = dataclasses.replace(cfg, vocab_size=int(config["vocab_size"]))
+            print(f"# Info: vocab_size overridden from YAML: {cfg.vocab_size}")
+        if config.get("ffw_size") is not None:
+            cfg = dataclasses.replace(cfg, ffw_size=int(config["ffw_size"]))
+            print(f"# Info: ffw_size overridden from YAML: {cfg.ffw_size}")
         # Set quantization flags and scale dtype
         # quant_scale_dtype should be a dtype (e.g., bfloat16), not a boolean
         quant_scale_dtype = dtype  # Use the same dtype as the model for quantization scales
